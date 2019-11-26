@@ -63,7 +63,8 @@ func (*MonitoringSuite) TestValidatesCGroupMounts(c *C) {
 			probes: health.Probes{
 				&pb.Probe{
 					Checker: cgroupCheckerID,
-					Error:   `Following CGroups have not been mounted: ["blkio"]`,
+					Detail:  "failed to validate cgroup mounts",
+					Error:   `following CGroups have not been mounted: ["blkio"]`,
 					Status:  pb.Probe_Failed,
 				},
 			},
@@ -99,14 +100,14 @@ func (*MonitoringSuite) TestValidatesCGroupMounts(c *C) {
 	}
 }
 
-func testMountsReader(data []byte) func() ([]mountPoint, error) {
-	return func() ([]mountPoint, error) {
+func testMountsReader(data []byte) mountGetterFunc {
+	return func(ctx context.Context) ([]mountPoint, error) {
 		return parseProcMounts(data)
 	}
 }
 
 func testFailingMountsReader(err error) mountGetterFunc {
-	return func() ([]mountPoint, error) {
+	return func(ctx context.Context) ([]mountPoint, error) {
 		return nil, err
 	}
 }

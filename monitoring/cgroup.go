@@ -16,9 +16,11 @@ limitations under the License.
 package monitoring
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"io/ioutil"
+	"os"
 	"strings"
 
 	"github.com/gravitational/satellite/agent/health"
@@ -31,7 +33,7 @@ import (
 // of cgroup mounts given with cgroups.
 // The checker should be executed in the host mount namespace.
 func NewCGroupChecker(cgroups ...string) health.Checker {
-	return cgroupChecker{
+	return &cgroupChecker{
 		cgroups:   cgroups,
 		getMounts: listProcMounts,
 	}
@@ -46,35 +48,39 @@ type cgroupChecker struct {
 
 // Name returns name of the checker
 // Implements health.Checker
-func (r cgroupChecker) Name() string {
+func (c *cgroupChecker) Name() string {
 	return cgroupCheckerID
 }
 
-// Check verifies existence of cgroup mounts given in r.cgroups.
+// Check verifies existence of cgroup mounts given in c.cgroups.
 // Implements health.Checker
-func (r cgroupChecker) Check(ctx context.Context, reporter health.Reporter) {
-	var probes health.Probes
-	err := r.check(ctx, &probes)
-	if err != nil && !trace.IsNotFound(err) {
-		reporter.Add(NewProbeFromErr(r.Name(), "failed to validate cgroup mounts", err))
+func (c *cgroupChecker) Check(ctx context.Context, reporter health.Reporter) {
+	probes, err := c.check(ctx)
+	if err != nil {
+		probes.Add(NewProbeFromErr(c.Name(), "failed to validate cgroup mounts", err))
 		return
 	}
-
-	health.AddFrom(reporter, &probes)
-	if probes.NumProbes() != 0 {
-		return
-	}
-
-	reporter.Add(NewSuccessProbe(r.Name()))
+	health.AddFrom(reporter, probes)
 }
 
-func (r cgroupChecker) check(ctx context.Context, reporter health.Reporter) error {
-	mounts, err := r.getMounts()
-	if err != nil {
-		return trace.Wrap(err, "failed to read mounts file")
+// check verifies that all expected cgroups have been mounted. Skips check if
+// mounts file is not available.
+func (c *cgroupChecker) check(ctx context.Context) (probes health.Reporter, err error) {
+	probes = &health.Probes{}
+
+	mounts, err := c.getMounts(ctx)
+
+	// Skip check if mounts file is not available
+	if trace.IsNotFound(err) {
+		probes.Add(NewSuccessProbe(c.Name()))
+		return probes, nil
 	}
 
-	expectedCgroups := utils.NewStringSetFromSlice(r.cgroups)
+	if err != nil {
+		return probes, trace.Wrap(err, "failed to read mounts file")
+	}
+
+	expectedCgroups := utils.NewStringSetFromSlice(c.cgroups)
 	for _, mount := range mounts {
 		if mount.FsType == cgroupMountType {
 			for _, opt := range mount.Options {
@@ -84,20 +90,20 @@ func (r cgroupChecker) check(ctx context.Context, reporter health.Reporter) erro
 			}
 		}
 	}
-
 	unmountedCgroups := expectedCgroups.Slice()
 	if len(unmountedCgroups) > 0 {
-		reporter.Add(NewProbeFromErr(r.Name(), "",
-			trace.NotFound("Following CGroups have not been mounted: %q", unmountedCgroups)))
+		return probes, trace.NotFound("following CGroups have not been mounted: %q", unmountedCgroups)
 	}
-	return nil
+
+	probes.Add(NewSuccessProbe(c.Name()))
+	return probes, nil
 }
 
 // listProcMounts returns the set of active mounts by interpreting
 // the /proc/mounts file.
 // The code is adopted from the kubernetes project.
-func listProcMounts() ([]mountPoint, error) {
-	content, err := consistentRead(mountFilePath, maxListTries)
+func listProcMounts(ctx context.Context) ([]mountPoint, error) {
+	content, err := consistentRead(ctx, mountFilePath, maxListTries)
 	if err != nil {
 		return nil, err
 	}
@@ -107,13 +113,22 @@ func listProcMounts() ([]mountPoint, error) {
 // consistentRead repeatedly reads a file until it gets the same content twice.
 // This is useful when reading files in /proc that are larger than page size
 // and kernel may modify them between individual read() syscalls.
-func consistentRead(filename string, attempts int) ([]byte, error) {
-	oldContent, err := ioutil.ReadFile(filename)
+func consistentRead(ctx context.Context, filename string, attempts int) ([]byte, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, trace.ConvertSystemError(err)
+	}
+	defer file.Close()
+
+	// Wrap file reader with a context. ReadAll will be interrupted when context is done
+	reader := utils.NewReaderWithContext(ctx, bufio.NewReader(file))
+
+	oldContent, err := ioutil.ReadAll(reader)
 	if err != nil {
 		return nil, trace.ConvertSystemError(err)
 	}
 	for i := 0; i < attempts; i++ {
-		newContent, err := ioutil.ReadFile(filename)
+		newContent, err := ioutil.ReadAll(reader)
 		if err != nil {
 			return nil, trace.ConvertSystemError(err)
 		}
@@ -165,7 +180,7 @@ type mountPoint struct {
 	Options []string
 }
 
-type mountGetterFunc func() ([]mountPoint, error)
+type mountGetterFunc func(ctx context.Context) ([]mountPoint, error)
 
 // mountFilePath specifies the location of the mount information file
 const mountFilePath = "/proc/mounts"
