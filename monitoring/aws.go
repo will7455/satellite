@@ -18,10 +18,17 @@ package monitoring
 
 import (
 	"context"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
 
+	"github.com/gravitational/satellite/agent/health"
+	"github.com/gravitational/satellite/lib/httplib"
+
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/gravitational/satellite/agent/health"
 	"github.com/gravitational/trace"
 )
 
@@ -38,26 +45,48 @@ type awsHasProfileChecker struct{}
 
 // Name returns this checker name
 // Implements health.Checker
-func (*awsHasProfileChecker) Name() string {
+func (c *awsHasProfileChecker) Name() string {
 	return awsHasProfileCheckerID
 }
 
 // Check will check the metadata API to see if an IAM profile is assigned to the node
 // Implements health.Checker
-func (*awsHasProfileChecker) Check(ctx context.Context, reporter health.Reporter) {
-	session, err := session.NewSession()
+func (c *awsHasProfileChecker) Check(ctx context.Context, reporter health.Reporter) {
+	probes, err := c.check(ctx)
 	if err != nil {
-		reporter.Add(NewProbeFromErr(awsHasProfileCheckerID, "failed to create session", trace.Wrap(err)))
+		reporter.Add(NewProbeFromErr(c.Name(), "failed to validate IAM profile", err))
 		return
 	}
-	metadata := ec2metadata.New(session)
+	health.AddFrom(reporter, probes)
+}
+
+// check will check the metadata API to see if an IAM profile is assigned to the node.
+func (c *awsHasProfileChecker) check(ctx context.Context) (probes health.Reporter, err error) {
+	probes = &health.Probes{}
+
+	sess, err := session.NewSession()
+	if err != nil {
+		return probes, trace.Wrap(err, "failed to create session")
+	}
+
+	config := sess.ClientConfig(ec2metadata.ServiceName)
+	config.Config.HTTPClient = &http.Client{
+		Transport: httplib.NewTransportWithContext(ctx),
+		Timeout:   5 * time.Second,
+	}
+
+	metadata := ec2metadata.NewClient(*config.Config, config.Handlers, config.Endpoint, config.SigningRegion)
 
 	_, err = metadata.IAMInfo()
-	if err != nil {
-		reporter.Add(NewProbeFromErr(awsHasProfileCheckerID, "failed to determine node IAM profile", trace.Wrap(err)))
-		return
+	if isContextCanceledError(err) {
+		return probes, trace.Wrap(err, "context canceled")
 	}
-	reporter.Add(NewSuccessProbe(awsHasProfileCheckerID))
+	if err != nil {
+		return probes, trace.Wrap(err, "failed to determine node IAM profile")
+	}
+
+	probes.Add(NewSuccessProbe(c.Name()))
+	return probes, nil
 }
 
 // IsRunningOnAWS attempts to use the AWS metadata API to determine if the
@@ -68,6 +97,31 @@ func IsRunningOnAWS() bool {
 	return metadata.Available()
 }
 
-const (
-	awsHasProfileCheckerID = "aws"
-)
+// isContextCanceledError returns true if the error is a context canceled error.
+func isContextCanceledError(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch err := unwrapAWSError(err).(type) {
+	case *url.Error:
+		return err.Err == context.Canceled
+	default:
+		return strings.Contains(err.Error(), "context canceled")
+	}
+}
+
+// unwrapAWSError unwraps the aws error and returns the orignal error. Returns
+// the provided error if it is not an aws error.
+func unwrapAWSError(err error) error {
+	if err != nil {
+		switch origErr := err.(type) {
+		case awserr.Error:
+			err = origErr.OrigErr()
+		default:
+			return err
+		}
+	}
+	return err
+}
+
+const awsHasProfileCheckerID = "aws"
