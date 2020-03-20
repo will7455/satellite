@@ -51,8 +51,8 @@ func serveMetrics(addr string) Task {
 	}
 }
 
-// recycleCache is a background process that periodically recycles the cache.
-func (r *Agent) recycleCache(ctx context.Context) error {
+// recycleCacheTask is a background process that periodically recycles the cache.
+func (r *Agent) recycleCacheTask(ctx context.Context) error {
 	ticker := r.Clock.NewTicker(recycleCacheInterval)
 	defer ticker.Stop()
 
@@ -69,22 +69,20 @@ func (r *Agent) recycleCache(ctx context.Context) error {
 	}
 }
 
-// updateClusterStatusLoop is a background process that periodically updates the health
+// updateClusterStatusTask is a background process that periodically updates the health
 // status of the cluster.
-func (r *Agent) updateClusterStatusLoop() Task {
-	return func(ctx context.Context) error {
-		ticker := r.Clock.NewTicker(updateClusterStatusInterval)
-		defer ticker.Stop()
+func (r *Agent) updateClusterStatusTask(ctx context.Context) error {
+	ticker := r.Clock.NewTicker(updateClusterStatusInterval)
+	defer ticker.Stop()
 
-		for {
-			select {
-			case <-ctx.Done():
-				log.Info("Recycle loop is stopping.")
-				return nil
-			case <-ticker.Chan():
-				if err := r.updateClusterStatus(ctx); err != nil {
-					log.WithError(err).Warn("Failed to update status.")
-				}
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("Cluster status update loop is stopping.")
+			return nil
+		case <-ticker.Chan():
+			if err := r.updateClusterStatus(ctx); err != nil {
+				log.WithError(err).Warn("Failed to update status.")
 			}
 		}
 	}
@@ -104,9 +102,20 @@ func (r *Agent) updateClusterStatus(ctx context.Context) error {
 
 // collectClusterStatus collects the cluster status.
 func (r *Agent) collectClusterStatus(ctx context.Context) (*pb.SystemStatus, error) {
-	members, err := r.ClusterMembership.Members()
+	client, err := membership.NewSerfClient(r.SerfConfig)
 	if err != nil {
-		return nil, trace.Wrap(err, "failed to query serf members")
+		return nil, trace.Wrap(err, "failed to connect to serf cluster")
+	}
+
+	defer func() {
+		if err := client.Close(); err != nil {
+			log.WithError(err).Warn("Failed to close serf client")
+		}
+	}()
+
+	members, err := client.Members()
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
 
 	log.WithField("members", members).Debug("Started collecting statuses from members.")
@@ -151,7 +160,7 @@ func (r *Agent) collectClusterStatus(ctx context.Context) (*pb.SystemStatus, err
 
 // getStatusFrom collects node status from the specified member.
 func (r *Agent) getStatusFrom(ctx context.Context, member membership.ClusterMember) (*pb.NodeStatus, error) {
-	client, err := member.Dial(ctx, r.CAFile, r.CertFile, r.KeyFile)
+	client, err := member.Dial(ctx, r.RPCConfig.CAFile, r.RPCConfig.CertFile, r.RPCConfig.KeyFile)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -160,52 +169,40 @@ func (r *Agent) getStatusFrom(ctx context.Context, member membership.ClusterMemb
 	return client.LocalStatus(ctx)
 }
 
-// updateLocalStatusLoop is a background process that periodically updates the
-// agent's local health status.
-func (r *Agent) updateLocalStatusLoop(ctx context.Context) error {
-	ticker := r.Clock.NewTicker(updateLocalStatusInterval)
+// pushEventsTask is a background process that periodically pushes new local
+// timeline events to all master nodes.
+func (r *Agent) pushEventsTask(ctx context.Context) error {
+	ticker := r.Clock.NewTicker(pushEventsInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Info("Local status update loop is stopping.")
+			log.Info("Push events task is stopping.")
 			return nil
 		case <-ticker.Chan():
-			if err := r.updateLocalStatus(ctx); err != nil {
-				log.WithError(err).Warn("Failed to update local status.")
+			if err := r.notifyMasters(ctx); err != nil {
+				log.WithError(err).Warn("Failed to notify master nodes of new local timeline events.")
 			}
 		}
 	}
 }
 
-// updateLocalStatus updates the local status.
-func (r *Agent) updateLocalStatus(ctx context.Context) error {
-	status, err := r.collectLocalStatus(ctx)
-	if err != nil {
-		return trace.Wrap(err, "failed to collect local status")
-	}
-
-	r.Lock()
-	changes := history.DiffNode(r.Clock, r.localStatus, status)
-	r.localStatus = status
-	r.Unlock()
-
-	if err := r.LocalTimeline.RecordEvents(ctx, changes); err != nil {
-		return trace.Wrap(err, "failed to record local timeline events")
-	}
-
-	if err := r.notifyMasters(ctx); err != nil {
-		return trace.Wrap(err, "failed to notify master nodes of local timeline events")
-	}
-
-	return trace.NotImplemented("not yet implemented")
-}
-
 // notifyMasters notifies the master nodes in the cluster of new local timeline
 // events.
 func (r *Agent) notifyMasters(ctx context.Context) error {
-	members, err := r.ClusterMembership.Members()
+	client, err := membership.NewSerfClient(r.SerfConfig)
+	if err != nil {
+		return trace.Wrap(err, "failed to connect to serf cluster")
+	}
+
+	defer func() {
+		if err := client.Close(); err != nil {
+			log.WithError(err).Warn("Failed to close serf client")
+		}
+	}()
+
+	members, err := client.Members()
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -230,7 +227,7 @@ func (r *Agent) notifyMasters(ctx context.Context) error {
 
 // notifyMaster notifies the speified member of the events.
 func (r *Agent) notifyMaster(ctx context.Context, member membership.ClusterMember, events []*pb.TimelineEvent) error {
-	client, err := member.Dial(ctx, r.CAFile, r.CertFile, r.KeyFile)
+	client, err := member.Dial(ctx, r.RPCConfig.CAFile, r.RPCConfig.CertFile, r.RPCConfig.KeyFile)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -253,10 +250,57 @@ func (r *Agent) notifyMaster(ctx context.Context, member membership.ClusterMembe
 	return nil
 }
 
+// updateLocalStatusTask is a background process that periodically updates the
+// agent's local health status.
+func (r *Agent) updateLocalStatusTask(ctx context.Context) error {
+	ticker := r.Clock.NewTicker(updateLocalStatusInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("Local status update loop is stopping.")
+			return nil
+		case <-ticker.Chan():
+			if err := r.updateLocalStatus(ctx); err != nil {
+				log.WithError(err).Warn("Failed to update local status.")
+			}
+		}
+	}
+}
+
+// updateLocalStatus updates the local status.
+func (r *Agent) updateLocalStatus(ctx context.Context) error {
+	status, err := r.collectLocalStatus(ctx)
+	if err != nil {
+		return trace.Wrap(err, "failed to collect local status")
+	}
+
+	events := history.DiffNode(r.Clock, r.getLocalStatus(), status)
+	if err := r.LocalTimeline.RecordEvents(ctx, events); err != nil {
+		return trace.Wrap(err, "failed to record local timeline events")
+	}
+
+	r.setLocalStatus(status)
+
+	return nil
+}
+
 // collectLocalStatus runs the agent's health checks and returns the resulting
 // status.
 func (r *Agent) collectLocalStatus(ctx context.Context) (*pb.NodeStatus, error) {
-	local, err := r.ClusterMembership.FindMember(r.SerfName)
+	client, err := membership.NewSerfClient(r.SerfConfig)
+	if err != nil {
+		return nil, trace.Wrap(err, "failed to connect to serf cluster")
+	}
+
+	defer func() {
+		if err := client.Close(); err != nil {
+			log.WithError(err).Warn("Failed to close serf client")
+		}
+	}()
+
+	local, err := client.FindMember(r.SerfName)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -329,6 +373,10 @@ func runChecker(ctx context.Context, checker health.Checker, probeCh chan<- heal
 
 	log.Debugf("Running checker %q.", checker.Name())
 
+	// Use a shorter timeout to allow time to report check results.
+	ctx, cancel := context.WithTimeout(ctx, checkerTimeout)
+	defer cancel()
+
 	checkCh := make(chan health.Reporter, 1)
 	go func() {
 		// Use a shorter timeout to allow time to cancel the checker before reporting.
@@ -340,8 +388,8 @@ func runChecker(ctx context.Context, checker health.Checker, probeCh chan<- heal
 		checkCh <- probes
 	}()
 
-	// Report probe results.
-	// If context is done return a failed probe indicating potential goroutine leak.
+	// If Check fails to report probes before parent context is done, return failed
+	// probe indicating potential goroutine leak.
 	select {
 	case probes := <-checkCh:
 		probeCh <- probes

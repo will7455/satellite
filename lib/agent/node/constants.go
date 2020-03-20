@@ -32,12 +32,24 @@ const (
 	// status update collections.
 	updateClusterStatusInterval = 30 * time.Second
 
+	// pushEventsInterval is the amount of time to wait between attempting to
+	// push new local timeline events to master nodes.
+	pushEventsInterval = 30 * time.Second
+
 	// updateLocalStatusInterval is the amount of time to wait between local
 	// status update collections.
 	updateLocalStatusInterval = updateClusterStatusInterval
 
-	// probeTimeout is the max amount of time to wait for a probe to complete.
-	probeTimeout = 15 * time.Second
+	// checkerTimeout is the max amount of time to wait for a checker to report
+	// results.
+	checkerTimeout = updateLocalStatusInterval - (5 * time.Second)
+
+	// probeTimeout is the max amount of time to wait for check to return probes.
+	probeTimeout = checkerTimeout - (5 * time.Second)
+
+	// timelineInitTimeout specifies the amount of time to wait for the
+	// timeline to initialize.
+	timelineInitTimeout = time.Minute
 )
 
 // maxConcurrentCheckers specifies the maximum number of checkers active at any

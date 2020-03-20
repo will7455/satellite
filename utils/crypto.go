@@ -21,10 +21,12 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"io/ioutil"
 	"math/big"
 	"net"
 	"os"
@@ -32,6 +34,41 @@ import (
 
 	"github.com/gravitational/trace"
 )
+
+// NewCertPool returns a new cert pool from the caFile
+func NewCertPool(caFile string) (*x509.CertPool, error) {
+	caCert, err := ioutil.ReadFile(caFile)
+	if err != nil {
+		return nil, trace.ConvertSystemError(err)
+	}
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+	return caCertPool, nil
+}
+
+// NewTLSConfig returns a new tls.Config using the caCertPool as client CA.
+func NewTLSConfig(caCertPool *x509.CertPool) *tls.Config {
+	tlsConfig := &tls.Config{
+		ClientCAs:  caCertPool,
+		ClientAuth: tls.RequireAndVerifyClientCert,
+		// Use TLS Modern capability suites
+		// https://wiki.mozilla.org/Security/Server_Side_TLS
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+		},
+		PreferServerCipherSuites: true,
+		MinVersion:               tls.VersionTLS12,
+	}
+	tlsConfig.BuildNameToCertificate()
+	return tlsConfig
+}
 
 // GenerateCert generates certificate & key files to use for development and
 // testing purposes.
