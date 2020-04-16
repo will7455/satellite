@@ -37,7 +37,6 @@ import (
 	"github.com/prometheus/common/expfmt"
 	log "github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 )
 
 // NethealthConfig specifies configuration for a nethealth checker.
@@ -499,15 +498,9 @@ const (
 
 // nethealthLabelSelector defines label selector used when querying for
 // nethealth pods.
-var nethealthLabelSelector = mustLabelSelector(metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
-	MatchLabels: map[string]string{
-		"k8s-app": "nethealth",
-	},
-}))
-
-func mustLabelSelector(selector labels.Selector, err error) labels.Selector {
-	if err != nil {
-		panic(err)
-	}
-	return selector
-}
+var nethealthLabelSelector = utils.MustLabelSelector(
+	metav1.LabelSelectorAsSelector(
+		&metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				"k8s-app": "nethealth",
+			}}))
