@@ -1,5 +1,5 @@
 /*
-Copyright 2019 Gravitational, Inc.
+Copyright 2020 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,70 +14,37 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package nethealth implements a daemonset that when deployed to a kubernetes cluster, will locate and send ICMP echos
-// (pings) to the nethealth pod on every other node in the cluster. This will give an indication into whether the
-// overlay network is functional for pod -> pod communications, and also record packet loss on the network.
 package nethealth
 
 import (
-	"fmt"
+	"context"
 	"net"
-	"net/http"
-	"reflect"
-	"sort"
 	"time"
 
+	"github.com/gravitational/satellite/utils"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
 
-const (
-	// heartbeatInterval is the duration between sending heartbeats to each peer. Any heartbeat that takes more
-	// than one interval to respond will also be considered timed out.
-	heartbeatInterval = 1 * time.Second
-
-	// resyncInterval is the duration between full resyncs of local state with kubernetes. If a node is deleted it
-	// may not be detected until the full resync completes.
-	resyncInterval = 15 * time.Minute
-
-	// dnsDiscoveryInterval is the duration of time for doing DNS based service discovery for pod changes. This is a
-	// lightweight test for whether there is a change to the nethealth pods within the cluster.
-	dnsDiscoveryInterval = 10 * time.Second
-
-	// Default selector to use for finding nethealth pods
-	DefaultSelector = "k8s-app=nethealth"
-
-	// DefaultServiceDiscoveryQuery is the default name to query for service discovery changes
-	DefaultServiceDiscoveryQuery = "any.nethealth"
-)
-
-const (
-	// Init is peer state that we've found the node but don't know anything about it yet.
-	Init = "init"
-	// Up is a peer state that the peer is currently reachable
-	Up = "up"
-	// Timeout is a peer state that the peer is currently timing out to pings
-	Timeout = "timeout"
-)
-
-type Config struct {
+type AppConfig struct {
+	// Clock will be used for internal time keeping.
+	clockwork.Clock
 	// PrometheusPort is the port to bind to for serving prometheus metrics
 	PrometheusPort uint32
-
 	// Namespace is the kubernetes namespace to monitor for other nethealth instances
 	Namespace string
-	// NodeName is the node this instance is running on
-	NodeName string
+	// HostIP is the host IP address
+	HostIP string
 	// Selector is a kubernetes selector to find all the nethealth pods in the configured namespace
 	Selector string
 	// ServiceDiscoveryQuery is a DNS name that will be used for lightweight service discovery checks. A query to
@@ -87,10 +54,104 @@ type Config struct {
 	ServiceDiscoveryQuery string
 }
 
-// New creates a new server to ping each peer.
-func (c Config) New() (*Server, error) {
+// checkAndSetDefaults validates that this configuration is correct and sets
+// value defaults where necessary.
+func (r *AppConfig) checkAndSetDefaults() error {
+	var errors []error
+	if r.HostIP == "" {
+		errors = append(errors, trace.BadParameter("host ip must be provided"))
+	}
+	if r.PrometheusPort == 0 {
+		r.PrometheusPort = DefaultPrometheusPort
+	}
+	if r.Namespace == "" {
+		r.Namespace = DefaultNamespace
+	}
+	if r.Selector == "" {
+		r.Selector = DefaultSelector
+	}
+	if r.ServiceDiscoveryQuery == "" {
+		r.ServiceDiscoveryQuery = DefaultServiceDiscoveryQuery
+	}
+	if r.Clock == nil {
+		r.Clock = clockwork.NewRealClock()
+	}
+	return trace.NewAggregate(errors...)
+}
 
-	promPeerRTT := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+// Application is an instance of nethealth that is running on each node.
+type Application struct {
+	AppConfig
+	logrus.FieldLogger
+
+	// conn specifies icmp packet network endpoint used to send and receive icmp messages
+	conn *icmp.PacketConn
+
+	// selector is used to query nethealth pods.
+	selector labels.Selector
+
+	// client is used to interface with the the kubernetes API.
+	client kubernetes.Interface
+
+	// rxMessage is a processing queue of received echo responses
+	rxMessage chan messageWrapper
+
+	// triggerHeartbeat triggers heartbeat.
+	triggerHeartbeat chan struct{}
+
+	// triggerResync triggers resync of nethealth pods.
+	triggerResync chan struct{}
+
+	// peers maps the ip address of a node to it's peer data.
+	peers map[string]*peer
+
+	// podToHost maps the nethealth pod IP to the node host IP.
+	podToHost map[string]string
+
+	// Registered Prometheus metrics.
+	promPeerRTT     *prometheus.HistogramVec
+	promPeerTimeout *prometheus.CounterVec
+	promPeerRequest *prometheus.CounterVec
+}
+
+func NewApp(config AppConfig) (*Application, error) {
+	if err := config.checkAndSetDefaults(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Initialize nethealth label selector
+	labelSelector, err := labels.Parse(config.Selector)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Initialize kubernetes clientset
+	kubernetesConfig, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	client, err := kubernetes.NewForConfig(kubernetesConfig)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	app := &Application{
+		AppConfig:        config,
+		FieldLogger:      logrus.WithField(trace.Component, "nethealth"),
+		selector:         labelSelector,
+		client:           client,
+		triggerResync:    make(chan struct{}, 1),
+		triggerHeartbeat: make(chan struct{}, 1),
+		rxMessage:        make(chan messageWrapper, 100),
+		peers:            make(map[string]*peer),
+		podToHost:        make(map[string]string),
+	}
+	app.registerMetrics()
+	return app, nil
+}
+
+func (r *Application) registerMetrics() {
+	r.promPeerRTT = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "nethealth",
 		Subsystem: "echo",
 		Name:      "duration_seconds",
@@ -117,13 +178,13 @@ func (c Config) New() (*Server, error) {
 			0.08,   // 80ms
 		},
 	}, []string{"node_name", "peer_name"})
-	promPeerTimeout := prometheus.NewCounterVec(prometheus.CounterOpts{
+	r.promPeerTimeout = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nethealth",
 		Subsystem: "echo",
 		Name:      "timeout_total",
 		Help:      "The number of echo requests that have timed out",
 	}, []string{"node_name", "peer_name"})
-	promPeerRequest := prometheus.NewCounterVec(prometheus.CounterOpts{
+	r.promPeerRequest = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "nethealth",
 		Subsystem: "echo",
 		Name:      "request_total",
@@ -131,468 +192,276 @@ func (c Config) New() (*Server, error) {
 	}, []string{"node_name", "peer_name"})
 
 	prometheus.MustRegister(
-		promPeerRTT,
-		promPeerTimeout,
-		promPeerRequest,
+		r.promPeerRTT,
+		r.promPeerTimeout,
+		r.promPeerRequest,
 	)
-
-	selector := DefaultSelector
-	if c.Selector != "" {
-		selector = c.Selector
-	}
-
-	labelSelector, err := labels.Parse(selector)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	if c.ServiceDiscoveryQuery == "" {
-		c.ServiceDiscoveryQuery = DefaultServiceDiscoveryQuery
-	}
-
-	return &Server{
-		config:          c,
-		FieldLogger:     logrus.WithField(trace.Component, "nethealth"),
-		promPeerRTT:     promPeerRTT,
-		promPeerTimeout: promPeerTimeout,
-		promPeerRequest: promPeerRequest,
-		selector:        labelSelector,
-		triggerResync:   make(chan bool, 1),
-		rxMessage:       make(chan messageWrapper, 100),
-		peers:           make(map[string]*peer),
-		addrToPeer:      make(map[string]string),
-	}, nil
 }
 
-// Server is an instance of nethealth that is running on each node responsible for sending and responding to heartbeats.
-type Server struct {
-	logrus.FieldLogger
+func (r *Application) Run(ctx context.Context) error {
+	ctx = context.WithValue(ctx, "application", r)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	config     Config
-	clock      clockwork.Clock
-	conn       *icmp.PacketConn
-	httpServer *http.Server
-	selector   labels.Selector
-
-	// rxMessage is a processing queue of received echo responses
-	rxMessage     chan messageWrapper
-	triggerResync chan bool
-
-	peers      map[string]*peer
-	addrToPeer map[string]string
-
-	client kubernetes.Interface
-
-	promPeerRTT     *prometheus.HistogramVec
-	promPeerTimeout *prometheus.CounterVec
-	promPeerRequest *prometheus.CounterVec
-}
-
-type peer struct {
-	name        string
-	addr        net.Addr
-	echoCounter int
-	echoTime    time.Time
-	echoTimeout bool
-
-	status           string
-	lastStatusChange time.Time
-}
-
-type messageWrapper struct {
-	message  *icmp.Message
-	rxTime   time.Time
-	peerAddr net.Addr
-}
-
-// Start sets up the server and begins normal operation
-func (s *Server) Start() error {
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	s.client, err = kubernetes.NewForConfig(config)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	s.conn, err = icmp.ListenPacket("ip4:icmp", "0.0.0.0")
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	s.clock = clockwork.NewRealClock()
-	go s.loop()
-	go s.loopServiceDiscovery()
-	go s.serve()
-
-	mux := http.ServeMux{}
-	mux.Handle("/metrics", promhttp.Handler())
-	s.httpServer = &http.Server{Addr: fmt.Sprint(":", s.config.PrometheusPort), Handler: &mux}
+	errChan := make(chan error, 10)
+	go loopMain(ctx)
+	go loopServiceDiscovery(ctx)
+	go loopHeartbeat(ctx)
+	go loopResync(ctx)
+	go loopHandleICMP(ctx)
 	go func() {
-		if err := s.httpServer.ListenAndServe(); err != http.ErrServerClosed {
-			s.Fatalf("ListenAndServe(): %s", err)
+		if err := serveMetrics(ctx); err != nil {
+			errChan <- err
 		}
 	}()
 
-	s.Info("Started nethealth with config:")
-	s.Info("  PrometheusPort: ", s.config.PrometheusPort)
-	s.Info("  Namespace: ", s.config.Namespace)
-	s.Info("  NodeName: ", s.config.NodeName)
-	s.Info("  Selector: ", s.selector)
-	s.Info("  ServiceDiscoveryQuery: ", s.config.ServiceDiscoveryQuery)
+	select {
+	case <-ctx.Done():
+		r.Info("Nethealth shutting down.")
+	case err := <-errChan:
+		return trace.Wrap(err)
+	}
 
 	return nil
 }
 
-// loop is the main processing loop for sending/receiving heartbeats.
-func (s *Server) loop() {
-	heartbeatTicker := s.clock.NewTicker(heartbeatInterval)
-	defer heartbeatTicker.Stop()
-
-	resyncTicker := s.clock.NewTicker(resyncInterval)
-	defer resyncTicker.Stop()
-
-	for {
-		select {
-		//
-		// Re-sync cluster peers
-		//
-		case <-resyncTicker.Chan():
-			err := s.resyncPeerList()
-			if err != nil {
-				s.WithError(err).Error("Unexpected error re-syncing the list of peer nodes.")
-			}
-
-			err = s.resyncNethealthPods()
-			if err != nil {
-				s.WithError(err).Error("Unexpected error re-syncing the list of peer pods.")
-			}
-		case <-s.triggerResync:
-			err := s.resyncPeerList()
-			if err != nil {
-				s.WithError(err).Error("Unexpected error re-syncing the list of peer nodes.")
-			}
-
-			err = s.resyncNethealthPods()
-			if err != nil {
-				s.WithError(err).Error("Unexpected error re-syncing the list of peer pods.")
-			}
-
-		//
-		// Send a heartbeat to each peer we know about
-		// Check for peers that are timing out / down
-		//
-		case <-heartbeatTicker.Chan():
-			s.checkTimeouts()
-			for _, peer := range s.peers {
-				s.sendHeartbeat(peer)
-			}
-
-		//
-		// Rx heartbeats responses from peers
-		//
-		case rx := <-s.rxMessage:
-			err := s.processAck(rx)
-			if err != nil {
-				s.WithFields(logrus.Fields{
-					logrus.ErrorKey: err,
-					"peer_addr":     rx.peerAddr,
-					"rx_time":       rx.rxTime,
-					"message":       rx.message,
-				}).Error("Error processing icmp message.")
-			}
-		}
-	}
-}
-
-// loopServiceDiscovery uses cluster-dns service discovery as a lightweight check for pod changes
-// and will trigger a resync if the cluster DNS service discovery changes
-func (s *Server) loopServiceDiscovery() {
-	s.Info("Starting DNS service discovery for nethealth pod.")
-	ticker := s.clock.NewTicker(dnsDiscoveryInterval)
-	query := s.config.ServiceDiscoveryQuery
-
-	previousNames := []string{}
-
-	for {
-		<-ticker.Chan()
-
-		s.Debugf("Querying %v for service discovery", query)
-		names, err := net.LookupHost(query)
-		if err != nil {
-			s.WithError(err).WithField("query", query).Error("Error querying service discovery.")
-			continue
-		}
-
-		sort.Strings(names)
-		if reflect.DeepEqual(names, previousNames) {
-			continue
-		}
-		previousNames = names
-		s.Info("Triggering peer resync due to service discovery change")
-
-		select {
-		case s.triggerResync <- true:
-		default:
-			// Don't block
-		}
-	}
-}
-
-// resyncPeerList contacts the kubernetes API to sync the list of kubernetes nodes
-func (s *Server) resyncPeerList() error {
-	nodes, err := s.client.CoreV1().Nodes().List(metav1.ListOptions{})
+func (r *Application) resync() error {
+	pods, err := r.client.CoreV1().Pods(r.Namespace).List(metav1.ListOptions{
+		LabelSelector: r.selector.String(),
+	})
 	if err != nil {
-		return trace.Wrap(err)
+		return utils.ConvertError(err)
 	}
+	r.resyncNethealth(pods.Items)
+	return nil
+}
 
+func (r *Application) resyncNethealth(pods []corev1.Pod) {
+	// keep track of current peers so we can prune nodes that are no longer part of the cluster
 	peerMap := make(map[string]bool)
-	for _, node := range nodes.Items {
+	for _, pod := range pods {
 		// Don't add our own node as a peer
-		if node.Name == s.config.NodeName {
+		if pod.Status.HostIP == r.HostIP {
 			continue
 		}
 
-		peerMap[node.Name] = true
-		if _, ok := s.peers[node.Name]; !ok {
-			s.peers[node.Name] = &peer{
-				name:             node.Name,
-				lastStatusChange: s.clock.Now(),
-				addr:             &net.IPAddr{},
-			}
-			s.WithField("peer", node.Name).Info("Adding peer.")
-			// Initialize the peer so it shows up in prometheus with a 0 count
-			s.promPeerTimeout.WithLabelValues(s.config.NodeName, node.Name).Add(0)
-			s.promPeerRequest.WithLabelValues(s.config.NodeName, node.Name).Add(0)
+		peerMap[pod.Status.HostIP] = true
+		if peer, ok := r.peers[pod.Status.HostIP]; ok {
+			peer.updatePodAddr(pod.Status.PodIP) // incase pod IP has changed
+			r.podToHost[pod.Status.PodIP] = pod.Status.HostIP
+			continue
 		}
+
+		// Initialize new peers
+		r.peers[pod.Status.HostIP] = newPeer(pod.Status.HostIP, pod.Status.PodIP, r.Clock.Now())
+		r.podToHost[pod.Status.PodIP] = pod.Status.HostIP
+		r.WithField("peer", pod.Status.HostIP).Info("Adding peer.")
+
+		// Initialize the peer so it shows up in prometheus with a 0 count
+		r.promPeerTimeout.WithLabelValues(r.HostIP, pod.Status.HostIP).Add(0)
+		r.promPeerRequest.WithLabelValues(r.HostIP, pod.Status.HostIP).Add(0)
 	}
 
 	// check for peers that have been deleted
-	for key := range s.peers {
-		if _, ok := peerMap[key]; !ok {
-			s.WithField("peer", key).Info("Deleting peer.")
-			delete(s.peers, key)
+	for _, peer := range r.peers {
+		if _, ok := peerMap[peer.hostIP]; !ok {
+			r.WithField("peer", peer.hostIP).Info("Deleting peer.")
+			delete(r.peers, peer.hostIP)
+			delete(r.podToHost, peer.podAddr.String())
+
+			r.promPeerRTT.DeleteLabelValues(r.HostIP, peer.hostIP)
+			r.promPeerRequest.DeleteLabelValues(r.HostIP, peer.hostIP)
+			r.promPeerTimeout.DeleteLabelValues(r.HostIP, peer.hostIP)
 		}
 	}
-
-	return nil
 }
 
-// resyncNethealthPods contacts the kubernetes API to sync the list of pods running the nethealth daemon
-func (s *Server) resyncNethealthPods() error {
-	list, err := s.client.CoreV1().Pods(s.config.Namespace).List(metav1.ListOptions{
-		LabelSelector: s.selector.String(),
-	})
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	for _, pod := range list.Items {
-		// skip our own pod
-		if pod.Spec.NodeName == s.config.NodeName {
-			continue
-		}
-
-		// skip if the peer object can't be located
-		if peer, ok := s.peers[pod.Spec.NodeName]; !ok {
-			continue
-		} else {
-			newAddr := &net.IPAddr{
-				IP: net.ParseIP(pod.Status.PodIP),
-			}
-
-			if peer.addr.String() != newAddr.String() {
-				s.WithFields(logrus.Fields{
-					"peer":          peer.name,
-					"new_peer_addr": newAddr,
-					"old_peer_addr": peer.addr,
-				}).Info("Updating peer pod IP address.")
-				peer.addr = newAddr
-				s.addrToPeer[peer.addr.String()] = pod.Spec.NodeName
-			}
-		}
-	}
-
-	// Free entries in the lookup table that no longer point to a valid object
-	for key, value := range s.addrToPeer {
-		if _, ok := s.peers[value]; !ok {
-			delete(s.addrToPeer, key)
-		}
-	}
-
-	return nil
-}
-
-// serve monitors for incoming icmp messages
-func (s *Server) serve() {
-	buf := make([]byte, 256)
-
-	for {
-		n, peerAddr, err := s.conn.ReadFrom(buf)
-		rxTime := s.clock.Now()
-		log := s.WithFields(logrus.Fields{
-			"peer_addr": peerAddr,
-			"node":      s.config.NodeName,
-			"length":    n,
+func (r *Application) sendHeartbeats() {
+	for _, peer := range r.peers {
+		log := r.WithFields(logrus.Fields{
+			"host_ip":  peer.hostIP,
+			"pod_addr": peer.podAddr,
+			"id":       peer.echoCounter,
 		})
-		if err != nil {
-			log.WithError(err).Error("Error in udp socket read.")
+		if err := r.sendHeartbeat(peer); err != nil {
+			log.WithError(err).Warn("Failed to send heartbeat.")
 			continue
 		}
+		log.Debug("Sent echo request.")
+	}
+}
 
-		// The ICMP package doesn't export the protocol numbers
-		// 1 - ICMP
-		// 58 - ICMPv6
-		// https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
-		msg, err := icmp.ParseMessage(1, buf[:n])
-		if err != nil {
-			log.WithError(err).Error("Error parsing icmp message.")
-			continue
-		}
+func (r *Application) sendHeartbeat(peer *peer) error {
+	peer.echoCounter++
 
-		select {
-		case s.rxMessage <- messageWrapper{
-			message:  msg,
-			rxTime:   rxTime,
-			peerAddr: peerAddr,
-		}:
-		default:
-			// Don't block
-			log.Warn("Dropped icmp message due to full rxMessage queue")
+	if peer.podAddr == nil || peer.podAddr.String() == "" || peer.podAddr.String() == "0.0.0.0" {
+		return trace.BadParameter("invalid pod address: %s", peer.podAddr.String())
+	}
+
+	msg := newEcho(peer.echoCounter)
+	buf, err := msg.Marshal(nil)
+	if err != nil {
+		return trace.Wrap(err, "failed to marshal ping")
+	}
+
+	peer.echoTime = r.Clock.Now()
+	_, err = r.conn.WriteTo(buf, peer.podAddr)
+	if err != nil {
+		return trace.Wrap(err, "failed to send ping")
+	}
+
+	r.promPeerRequest.WithLabelValues(r.HostIP, peer.hostIP).Inc()
+	peer.echoTimeout = true
+
+	return nil
+}
+
+// checkTimeouts iterates over each peer and checks whether our last heartbeat has timed out.
+func (r *Application) checkTimeouts() {
+	for _, peer := range r.peers {
+		// if the echoTimeout flag is set, it means we didn't receive a response to our last request
+		if peer.echoTimeout {
+			r.WithFields(logrus.Fields{
+				"host_ip":  peer.hostIP,
+				"pod_addr": peer.podAddr,
+				"id":       peer.echoCounter,
+			}).Debug("echo timeout")
+			r.promPeerTimeout.WithLabelValues(r.HostIP, peer.hostIP).Inc()
+			peer.updateStatus(Timeout, r.Clock.Now())
 		}
 	}
 }
 
-func (s *Server) lookupPeer(addr string) (*peer, error) {
-	peerName, ok := s.addrToPeer[addr]
-	if !ok {
-		return nil, trace.BadParameter("address not found in address table").AddField("address", addr)
-	}
-
-	p, ok := s.peers[peerName]
-	if !ok {
-		return nil, trace.BadParameter("peer not found in peer table").AddField("peer_name", peerName)
-	}
-	return p, nil
-}
-
-// processAck processes a received ICMP Ack message
-func (s *Server) processAck(e messageWrapper) error {
+// processAck processes a received ICMP Ack message.
+func (r *Application) processAck(e messageWrapper) error {
 	switch e.message.Type {
-	case ipv4.ICMPTypeEchoReply:
-		// ok
-	case ipv4.ICMPTypeEcho:
-		// nothing to do with echo requests
+	case ipv4.ICMPTypeEchoReply: // ok
+		if err := r.processEchoReply(e.message.Body, e.podAddr, e.rxTime); err != nil {
+			return trace.Wrap(err, "failed to process echo reply")
+		}
+	case ipv4.ICMPTypeEcho: // nothing with echo requests
 		return nil
-	default:
-		//unexpected / unknown
+	default: // unexpected / unknown
 		return trace.BadParameter("received unexpected icmp message type").AddField("type", e.message.Type)
 	}
+	return nil
+}
 
-	switch pkt := e.message.Body.(type) {
+func (r *Application) processEchoReply(body icmp.MessageBody, podAddr net.Addr, rxTime time.Time) error {
+	switch pkt := body.(type) {
 	case *icmp.Echo:
-		peer, err := s.lookupPeer(e.peerAddr.String())
+		peer, err := r.lookupPeer(podAddr.String())
 		if err != nil {
-			return trace.Wrap(err)
+			return trace.BadParameter("received echo reply from unknown pod %s", podAddr)
 		}
+
 		if uint16(pkt.Seq) != uint16(peer.echoCounter) {
 			return trace.BadParameter("response sequence doesn't match latest request.").
 				AddField("expected", uint16(peer.echoCounter)).
 				AddField("received", uint16(pkt.Seq))
 		}
 
-		rtt := e.rxTime.Sub(peer.echoTime)
-		s.promPeerRTT.WithLabelValues(s.config.NodeName, peer.name).Observe(rtt.Seconds())
-		s.updatePeerStatus(peer, Up)
+		rtt := rxTime.Sub(peer.echoTime)
+		r.promPeerRTT.WithLabelValues(r.HostIP, peer.hostIP).Observe(rtt.Seconds())
+		peer.updateStatus(Up, r.Clock.Now())
 		peer.echoTimeout = false
 
-		s.WithFields(logrus.Fields{
-			"peer_name": peer.name,
-			"peer_addr": peer.addr,
-			"counter":   peer.echoCounter,
-			"seq":       uint16(peer.echoCounter),
-			"rtt":       rtt,
+		r.WithFields(logrus.Fields{
+			"host_ip":  peer.hostIP,
+			"pod_addr": peer.podAddr,
+			"counter":  peer.echoCounter,
+			"seq":      uint16(peer.echoCounter),
+			"rtt":      rtt,
 		}).Debug("Ack.")
 	default:
-		s.WithFields(logrus.Fields{
-			"peer_addr": e.peerAddr.String(),
-		}).Warn("Unexpected icmp message")
+		r.WithField("pod_addr", podAddr.String()).Warn("Unexpected icmp message")
 	}
 	return nil
 }
 
-func (s *Server) sendHeartbeat(peer *peer) {
-	peer.echoCounter++
-	log := s.WithFields(logrus.Fields{
-		"peer_name": peer.name,
-		"peer_addr": peer.addr,
-		"id":        peer.echoCounter,
-	})
-
-	// If we don't know the pod IP address of the peer, we still want to generate a timeout, but not actually send
-	// a heartbeat
-	peer.echoTimeout = true
-	if peer.addr == nil || peer.addr.String() == "" || peer.addr.String() == "0.0.0.0" {
-		return
+func (r *Application) lookupPeer(podIP string) (*peer, error) {
+	hostIP, ok := r.podToHost[podIP]
+	if !ok {
+		return nil, trace.BadParameter("pod IP not found in lookup table").AddField("pod_addr", podIP)
 	}
 
-	msg := icmp.Message{
+	p, ok := r.peers[hostIP]
+	if !ok {
+		return nil, trace.BadParameter("peer not found in peer table").AddField("host_ip", hostIP)
+	}
+	return p, nil
+}
+
+func newEcho(seq int) icmp.Message {
+	return icmp.Message{
 		Type: ipv4.ICMPTypeEcho,
 		Code: 0,
 		Body: &icmp.Echo{
 			ID:  1,
-			Seq: peer.echoCounter,
+			Seq: seq,
 		},
 	}
-	buf, err := msg.Marshal(nil)
-	if err != nil {
-		log.WithError(err).Warn("Failed to marshal ping.")
-		return
-	}
-
-	peer.echoTime = s.clock.Now()
-	_, err = s.conn.WriteTo(buf, peer.addr)
-	if err != nil {
-		log.WithError(err).Warn("Failed to send ping.")
-		return
-	}
-	s.promPeerRequest.WithLabelValues(s.config.NodeName, peer.name).Inc()
-
-	log.Debug("Sent echo request.")
 }
 
-// checkTimeouts iterates over each peer, and checks whether our last heartbeat has timed out
-func (s *Server) checkTimeouts() {
-	s.Debug("checking for timeouts")
-	for _, peer := range s.peers {
-		// if the echoTimeout flag is set, it means we didn't receive a response to our last request
-		if peer.echoTimeout {
-			s.WithFields(logrus.Fields{
-				"peer_name": peer.name,
-				"peer_addr": peer.addr,
-				"id":        peer.echoCounter,
-			}).Debug("echo timeout")
-			s.promPeerTimeout.WithLabelValues(s.config.NodeName, peer.name).Inc()
-			s.updatePeerStatus(peer, Timeout)
-		}
+type messageWrapper struct {
+	message *icmp.Message
+	rxTime  time.Time
+	podAddr net.Addr
+}
+
+type peer struct {
+	// hostIP specifies the peer's node IP.
+	hostIP string
+	// podAddr specifies the nethealth pod's IP address.
+	podAddr net.Addr
+
+	echoCounter int
+	echoTime    time.Time
+	echoTimeout bool
+
+	// status specifies the current peer's status.
+	status string
+	// lastStatusChange specifies the timestamp when the peer's status was last changed.
+	lastStatusChange time.Time
+}
+
+// newPeer constructs a new peer with the provided config values.
+func newPeer(hostIP, podIP string, ts time.Time) *peer {
+	return &peer{
+		hostIP:           hostIP,
+		lastStatusChange: ts,
+		podAddr:          &net.IPAddr{IP: net.ParseIP(podIP)},
 	}
 }
 
-func (s *Server) updatePeerStatus(peer *peer, status string) {
-	if peer.status == status {
+// updatePodAddr updates the peer's pod address.
+func (r *peer) updatePodAddr(podIP string) {
+	newAddr := &net.IPAddr{
+		IP: net.ParseIP(podIP),
+	}
+	if r.podAddr.String() == newAddr.String() {
 		return
 	}
+	logrus.WithFields(logrus.Fields{
+		"host_ip":       r.hostIP,
+		"new_peer_addr": newAddr,
+		"old_peer_addr": r.podAddr,
+	}).Info("Updating peer pod IP address.")
+	r.podAddr = newAddr
+}
 
-	s.WithFields(logrus.Fields{
-		"peer_name":  peer.name,
-		"peer_addr":  peer.addr,
-		"duration":   s.clock.Now().Sub(peer.lastStatusChange),
-		"old_status": peer.status,
+// updateStatus updates the peer's status.
+func (r *peer) updateStatus(status string, ts time.Time) {
+	if r.status == status {
+		return
+	}
+	logrus.WithFields(logrus.Fields{
+		"host_ip":    r.hostIP,
+		"pod_addr":   r.podAddr,
+		"duration":   ts.Sub(r.lastStatusChange),
+		"old_status": r.status,
 		"new_status": status,
 	}).Info("Peer status changed.")
-
-	peer.status = status
-	peer.lastStatusChange = s.clock.Now()
-
+	r.status = status
+	r.lastStatusChange = ts
 }

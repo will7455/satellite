@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"os"
 	"os/signal"
 	"syscall"
@@ -53,8 +54,7 @@ func run() error {
 		crunPrometheusPort = crun.Flag("prom-port", "The prometheus port to bind to").Default("9801").Uint32()
 		crunNamespace      = crun.Flag("namespace", "The kubernetes namespace to watch for nethealth pods").
 					Default("monitoring").OverrideDefaultFromEnvar("POD_NAMESPACE").String()
-		crunNodeName = crun.Flag("node-name", "The name of the node we're running on").
-				OverrideDefaultFromEnvar("NODE_NAME").String()
+		crunHostIP   = crun.Flag("host-ip", "The host IP address").OverrideDefaultFromEnvar("HOST_IP").String()
 		crunSelector = crun.Flag("pod-selector", "The kubernetes selector to identify nethealth pods").
 				Default(nethealth.DefaultSelector).String()
 	)
@@ -84,27 +84,28 @@ func run() error {
 		return nil
 
 	case crun.FullCommand():
-		config := nethealth.Config{
+		appConfig := nethealth.AppConfig{
 			PrometheusPort: *crunPrometheusPort,
 			Namespace:      *crunNamespace,
-			NodeName:       *crunNodeName,
+			HostIP:         *crunHostIP,
 			Selector:       *crunSelector,
 		}
 
-		server, err := config.New()
+		app, err := nethealth.NewApp(appConfig)
 		if err != nil {
 			return trace.Wrap(err)
 		}
 
-		err = server.Start()
-		if err != nil {
-			return trace.Wrap(err)
-		}
-
+		ctx, cancel := context.WithCancel(context.Background())
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-		sig := <-sigs
-		log.Info("Exiting on signal: ", sig)
+		go func() {
+			sig := <-sigs
+			cancel()
+			log.Info("Exiting on signal: ", sig)
+		}()
+
+		app.Run(ctx)
 	}
 
 	return nil
